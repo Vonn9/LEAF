@@ -6,7 +6,7 @@ Description:
        - Each category contributes at least MIN_PER_CATEGORY queries
        - Remaining budget filled proportionally from larger categories
        - Ensures all 420+ categories get training coverage
-    2. For each query: ChromaDB top-K + enrich candidates
+    2. For each query: ChromaDB top-K ∪ BM25 top-K/2 + enrich candidates
        (cosine_score, bm25_score, retrieval_rank, cosine_title,
         log_content_length, title_token_overlap)
     3. Cross-encoder → per-query min-max normalized labels (y)
@@ -51,22 +51,31 @@ from processing import (
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DATASET_PATH      = "./dataset.json"
-DB_PATH           = "./chroma_db"
+# Shipped artifacts (xgb_model.json / training_cache / best_params.json) live
+# inside the src/ folder so they travel with the codebase. Inputs and
+# regenerated artifacts (dataset, ChromaDB, title vectors) live one level up,
+# at the project root, so they are not bundled into src.zip on submission.
+_HERE = os.path.dirname(os.path.abspath(__file__))           # src/
+_ROOT = os.path.dirname(_HERE)                                # parent of src/
+
+DATASET_PATH      = os.path.join(_ROOT, "dataset.json")
+DB_PATH           = os.path.join(_ROOT, "chroma_db")
+TITLE_VECS_PATH   = os.path.join(_ROOT, "title_vecs.npz")
+
 COLLECTION_NAME   = "prompt_collection"
 EMBED_MODEL_NAME  = "BAAI/bge-base-en-v1.5"
 RERANK_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
-MODEL_SAVE_PATH   = "./xgb_model.json"
-BEST_PARAMS_PATH  = "./best_params.json"
-TITLE_VECS_PATH   = "./title_vecs.npz"
 
-N_QUERIES        = 500
+MODEL_SAVE_PATH   = os.path.join(_HERE, "xgb_model.json")
+BEST_PARAMS_PATH  = os.path.join(_HERE, "best_params.json")
+
+N_QUERIES        = 1200
 MIN_PER_CATEGORY = 3
 TOP_K            = 50
 RANDOM_SEED      = 42
 QUERY_BATCH_SIZE = 32
-CACHE_VERSION    = "v9"
-CACHE_PATH       = f"./training_cache_{CACHE_VERSION}.npz"
+CACHE_VERSION    = "v10"
+CACHE_PATH       = os.path.join(_HERE, f"training_cache_{CACHE_VERSION}.npz")
 
 VAL_RATIO  = 0.15
 TEST_RATIO = 0.15
@@ -180,6 +189,18 @@ def stratified_sample_queries(df, n_total: int, min_per_cat: int, seed: int) -> 
                     remaining -= extra_n
 
     result = [pair for pairs in sampled.values() for pair in pairs]
+    remaining = n_total - len(result)
+    if remaining > 0:
+        selected = set(result)
+        leftovers = [
+            pair
+            for cat in cats
+            for pair in groups[cat]
+            if pair not in selected
+        ]
+        if leftovers:
+            result.extend(rng.sample(leftovers, min(remaining, len(leftovers))))
+
     rng.shuffle(result)
     return result[:n_total]
 
@@ -360,6 +381,7 @@ def main():
                         "content":      docs[j],
                         "metadata":     metas[j],
                         "cosine_score": 1.0 - distances[j],
+                        "retrieval_source": "vector",
                     }
                     for j in range(len(docs))
                 ]
@@ -368,6 +390,59 @@ def main():
                     c for c in candidates
                     if str(c["metadata"].get("id", "")) != source_id
                 ]
+
+                seen_ids = {str(c["metadata"].get("id", "")) for c in candidates}
+                q_tokens_bm25 = _tokenize_with_bigrams(query)
+                bm25_scores = bm25.get_scores(q_tokens_bm25)
+                top_bm25 = sorted(
+                    range(len(bm25_scores)),
+                    key=lambda idx: bm25_scores[idx],
+                    reverse=True,
+                )[:TOP_K // 2]
+
+                bm25_rows = []
+                bm25_ids = []
+                for bm25_idx in top_bm25:
+                    row = df.iloc[bm25_idx]
+                    doc_id = str(row["id"])
+                    if doc_id == source_id or doc_id in seen_ids:
+                        continue
+                    seen_ids.add(doc_id)
+                    bm25_rows.append(row)
+                    bm25_ids.append(doc_id)
+
+                bm25_vecs_by_id = {}
+                if bm25_ids:
+                    fetched = collection.get(ids=bm25_ids, include=["embeddings"])
+                    fetched_ids = fetched.get("ids", [])
+                    fetched_embeddings = fetched.get("embeddings")
+                    if fetched_embeddings is not None:
+                        for doc_id, vec in zip(fetched_ids, fetched_embeddings):
+                            bm25_vecs_by_id[str(doc_id)] = np.asarray(vec, dtype=np.float32)
+
+                for row, doc_id in zip(bm25_rows, bm25_ids):
+                    doc_vec = bm25_vecs_by_id.get(doc_id)
+                    cosine_score = 0.0
+                    if doc_vec is not None and doc_vec.shape == q_vec_np.shape:
+                        cosine_score = float(doc_vec @ q_vec_np)
+
+                    candidates.append({
+                        "content": str(row.get("title", "")) + ". " + str(row.get("content", "")),
+                        "metadata": {
+                            "id": str(row.get("id", "")),
+                            "title": str(row.get("title", "")),
+                            "category": str(row.get("category", "")),
+                            "likes": int(row.get("likes", 0)),
+                            "upvotes": int(row.get("upvotes", 0)),
+                            "downvotes": int(row.get("downvotes", 0)),
+                            "views": int(row.get("views", 0)),
+                            "uses": int(row.get("uses", 0)),
+                            "fork_count": int(row.get("fork_count", 0)),
+                            "author_reputation": int(row.get("author_reputation", 0)),
+                        },
+                        "cosine_score": cosine_score,
+                        "retrieval_source": "bm25",
+                    })
                 if not candidates:
                     batch_candidates.append(None)
                     batch_q_indices.append(None)

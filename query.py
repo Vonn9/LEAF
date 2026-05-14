@@ -26,7 +26,7 @@ import ollama
 from sentence_transformers import SentenceTransformer
 
 from rerank import load_reranker, cross_encode
-from processing import build_bm25_index, build_category_index
+from processing import build_bm25_index, build_category_index, _tokenize_with_bigrams
 from XGboost import (
     enrich_candidates,
     build_features,
@@ -42,7 +42,9 @@ from dataload import load_data
 
 TOP_K_RETRIEVE = 50
 TOP_K_RETURN   = 10
-MIN_COSINE     = 0.35   # filter BM25-only / near-zero vector hits before XGBoost
+MIN_COSINE     = 0.35   # strong semantic gate for vector candidates
+BM25_MIN_COSINE = 0.20  # weak semantic floor for lexical-only candidates
+MIN_BM25_REL_RANK = 0.70  # keep only high-ranking BM25 candidates
 
 HYDE_MODEL       = "qwen2.5:3b"
 HYDE_THRESHOLD   = 0.68   # avg top-3 cosine ≥ this → skip HyDE
@@ -178,20 +180,41 @@ class SearchEngine:
                 "content":      results["documents"][0][i],
                 "metadata":     meta,
                 "cosine_score": 1.0 - results["distances"][0][i],
+                "retrieval_source": "vector",
             })
 
         # 5. BM25 hybrid: add top-N/2 BM25 hits not already retrieved
-        q_tokens   = query.lower().split()
+        q_tokens   = _tokenize_with_bigrams(query)
         bm25_scores = self.bm25.get_scores(q_tokens)
         top_bm25   = sorted(range(len(bm25_scores)),
                             key=lambda i: bm25_scores[i], reverse=True)[:n // 2]
 
+        bm25_rows = []
+        bm25_ids  = []
         for idx in top_bm25:
             row    = self.df.iloc[idx]
             doc_id = str(row["id"])
             if doc_id in seen_ids:
                 continue
             seen_ids.add(doc_id)
+            bm25_rows.append(row)
+            bm25_ids.append(doc_id)
+
+        bm25_vecs_by_id = {}
+        if bm25_ids:
+            fetched = self.collection.get(ids=bm25_ids, include=["embeddings"])
+            fetched_ids = fetched.get("ids", [])
+            fetched_embeddings = fetched.get("embeddings")
+            if fetched_embeddings is not None:
+                for doc_id, vec in zip(fetched_ids, fetched_embeddings):
+                    bm25_vecs_by_id[str(doc_id)] = np.asarray(vec, dtype=np.float32)
+
+        for row, doc_id in zip(bm25_rows, bm25_ids):
+            doc_vec = bm25_vecs_by_id.get(doc_id)
+            cosine_score = 0.0
+            if doc_vec is not None and doc_vec.shape == q_vec_np.shape:
+                cosine_score = float(doc_vec @ q_vec_np)
+
             candidates.append({
                 "content":  str(row.get("title", "")) + ". " + str(row.get("content", "")),
                 "metadata": {
@@ -206,7 +229,8 @@ class SearchEngine:
                     "fork_count":       int(row.get("fork_count", 0)),
                     "author_reputation":int(row.get("author_reputation", 0)),
                 },
-                "cosine_score": 0.0,  # BM25-only hit; XGBoost uses bm25_score instead
+                "cosine_score": cosine_score,
+                "retrieval_source": "bm25",
             })
 
         return candidates, q_vec_np
@@ -240,7 +264,19 @@ class SearchEngine:
                           self.bm25, self.id_to_idx, self.embedder,
                           self.cat_embeddings, title_vecs_dict=self.title_vecs_dict)
 
-        candidates = [c for c in candidates if c["cosine_score"] >= MIN_COSINE]
+        candidates = [
+            c for c in candidates
+            if (
+                c["cosine_score"] >= MIN_COSINE
+                or (
+                    c.get("bm25_score", 0.0) > 0
+                    and c.get("bm25_rel_rank", 0.0) >= MIN_BM25_REL_RANK
+                    and c["cosine_score"] >= BM25_MIN_COSINE
+                )
+            )
+        ]
+        if not candidates:
+            return []
 
         features = build_features(candidates)
         scores   = self.xgb_model.predict(features)
@@ -325,46 +361,46 @@ if __name__ == "__main__":
     engine = SearchEngine()
 
     test_queries = [
-    # Programming & Debugging (15)
-    "implement binary search tree in Python",
-    "write a REST API with FastAPI",
-    "debug null pointer exception in Java",
+        # Creative writing
+        "develop a serialized fantasy story arc with character motivations and episode outline",
 
-    # Marketing & Business (12)
-    "write a product launch announcement email",
-    "create a social media content calendar",
-  
+        # Marketing / SEO / e-commerce
+        "create an SEO audit checklist for an e-commerce product page",
+        "write persuasive ad copy for a new skincare product launch",
 
-    # Creative Writing (12)
-    "write the opening chapter of a fantasy novel",
-  
-    # Education & Explanation (12)
-    "explain blockchain technology to a complete beginner",
-    "teach me about the causes of World War II",
-  
+        # Sales
+        "write a cold call script for qualifying B2B sales leads",
+        "create follow-up email templates after a trade show conversation",
 
-    # Career & Professional (10)
-    "write a LinkedIn profile summary for a data scientist",
-    "how to prepare for a technical coding interview",
-   
+        # Legal / compliance
+        "review a vendor contract for legal risks and liability clauses",
+        "draft a GDPR consent form for collecting customer data",
 
-    # Health & Wellness (8)
-    "create a 4-week meal plan for muscle building",
-    "write a guided meditation script for anxiety relief",
-   
+        # Customer support
+        "write an empathetic customer support reply about a duplicate billing charge",
+        "create an FAQ article explaining a return policy clearly",
 
-    # Science & Technology (8)
-    "explain quantum entanglement in simple terms",
- 
+        # Design / UX
+        "generate an accessible color palette and typography system for a website",
+        "explain form design best practices for better user experience",
 
-    # Social Media & Content Creation (8)
-    "write a YouTube video script introduction hook",
+        # Data analysis / SQL
+        "explain SQL joins with simple examples for a beginner analyst",
+        "clean messy survey data and summarize the main findings",
 
+        # Translation / localization
+        "translate a formal business email from English to Spanish with polite tone",
+        "prepare source content for app internationalization and localization",
 
-    # Analysis & Research (8)
-    "write a SWOT analysis template for a new business",
+        # Finance / accounting
+        "build a due diligence checklist for acquiring a small manufacturing company",
+        "forecast monthly revenue for a subscription business model",
 
-]
+        # Coding / DevOps / security
+        "refactor a React component and write Jest unit tests",
+        "debug docker compose networking between backend and database services",
+        "create a vulnerability assessment checklist for a small company network",
+    ]
 
     for q in test_queries:
         engine.ab_test(q, top_k=5)
